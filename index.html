@@ -52,6 +52,7 @@ header{display:flex;align-items:baseline;justify-content:space-between;margin:4p
 .chip.w{background:#fff}.chip.b{background:#111;border-color:#888}
 .badge{font:11px ui-monospace,Menlo,monospace;color:var(--mute);border:1px solid var(--line);border-radius:20px;padding:2px 8px}
 .badge.fresh{color:var(--acc);border-color:#5a4410}
+.badge.rev{color:#ff8a95;border-color:#5a2028}
 .boardwrap{position:relative;width:100%;aspect-ratio:1/1;border-radius:10px;overflow:hidden;box-shadow:0 10px 40px rgba(0,0,0,.5);touch-action:manipulation;user-select:none;-webkit-user-select:none}
 .bd{position:relative;width:100%;height:100%}
 .grid{display:grid;grid-template-columns:repeat(8,1fr);grid-template-rows:repeat(8,1fr);width:100%;height:100%}
@@ -60,6 +61,9 @@ header{display:flex;align-items:baseline;justify-content:space-between;margin:4p
 .sq.last::before,.sq.sel::before{content:'';position:absolute;inset:0}
 .sq.last::before{background:rgba(255,184,32,.36)}
 .sq.sel::before{background:rgba(255,176,32,.62)}
+.sq.hover::after{content:'';position:absolute;inset:0;box-shadow:inset 0 0 0 4px rgba(255,255,255,.85);pointer-events:none}
+#board{touch-action:none}
+.pc.ghost{position:fixed;z-index:50;pointer-events:none;line-height:1;transform:translate(-50%,-58%) scale(1.15);filter:drop-shadow(0 8px 10px rgba(0,0,0,.45))}
 .pc{position:relative;line-height:1;font-size:6vw;font-size:84cqh;font-family:"Segoe UI Symbol","Noto Sans Symbols 2","DejaVu Sans","Apple Symbols",serif;transform:translateY(-3%)}
 .pc.w{color:#fff;text-shadow:0 0 1px #000,1px 0 0 #000,-1px 0 0 #000,0 1px 0 #000,0 -1px 0 #000,1px 1px 0 #000,-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,0 3px 4px rgba(0,0,0,.35)}
 .pc.b{color:#14171b;text-shadow:0 0 1px rgba(255,255,255,.5),0 3px 4px rgba(0,0,0,.3)}
@@ -153,6 +157,7 @@ details.about code{font-size:12px;color:var(--acc)}
 <p>Inside this page is a chess engine written from scratch for it: a <code>0x88</code> board, full legal move generation (castling, en passant, promotions, checked against standard perft counts), and alpha-beta search with quiescence, check extensions and killer-move ordering. No libraries and no server.</p>
 <p>It runs on several of your CPU cores at once as Web Workers. Each worker plays quick, slightly sloppy games against itself and checks every position: <em>is material level, does no simple capture win, and is there exactly one move that wins at least three pawns or mates?</em> Positions that pass become puzzles. That rules out "take the hanging piece", so what's left are forks, discovered attacks, sacrifices and mates.</p>
 <p>A starter bank of puzzles, mined the same way and checked one ply deeper, lets you play straight away. Fresh ones from your own device (tagged ⚡) go to the front of the queue as soon as they're found.</p>
+<p>Everything your device mines is saved in this browser (IndexedDB), along with how you did on every puzzle you've played, so your library keeps growing between visits. Unplayed puzzles come first, ones you've already solved are skipped, and ones you missed come back now and then as <b>↺ revenge</b>. The library lives in this browser only. Clearing site data wipes it.</p>
 </details>
 </main>
 
@@ -489,17 +494,41 @@ function renderBoard(el,P,o){
 }
 
 /* ---------- puzzle supply: bank + live miners ---------- */
-const Mine={workers:[],stats:[],fresh:[],seen:new Set(),total:store.get('mined',0),session:0,error:null,lastNodes:0,lastT:0,nps:0,t0:performance.now(),paused:false};
+const Mine={workers:[],stats:[],seen:new Set(),session:0,error:null,lastNodes:0,lastT:0,nps:0,t0:performance.now(),wall0:Date.now(),paused:false};
+/* persistent collection (IndexedDB): every mined puzzle + every puzzle you've played, with your results */
+const Coll=new Map();
+const DB={db:null,
+  open(){return new Promise(res=>{try{const rq=indexedDB.open('zeitnot',1);rq.onupgradeneeded=()=>rq.result.createObjectStore('puzzles',{keyPath:'f'});rq.onsuccess=()=>{DB.db=rq.result;res();};rq.onerror=()=>res();rq.onblocked=()=>res();}catch(e){res();}});},
+  all(){return new Promise(res=>{if(!DB.db)return res([]);try{const rq=DB.db.transaction('puzzles').objectStore('puzzles').getAll();rq.onsuccess=()=>res(rq.result||[]);rq.onerror=()=>res([]);}catch(e){res([]);}});},
+  put(r){if(!DB.db)return;try{DB.db.transaction('puzzles','readwrite').objectStore('puzzles').put(r);}catch(e){}}};
+const clean=p=>({f:p.f,m:p.m,s:p.s,k:p.k,t:p.t,l:p.l,ln:p.ln,n:p.n});
+function record(pz,ok){
+  const r=Coll.get(pz.f)||Object.assign(clean(pz),{src:'bank'});
+  r.solved=(r.solved||0)+(ok?1:0);r.missed=(r.missed||0)+(ok?0:1);r.last=ok?'ok':'miss';r.lastAt=Date.now();
+  Coll.set(r.f,r);DB.put(r);
+}
+function collStats(){let mined=0,solved=0,revenge=0,unplayed=0;for(const r of Coll.values()){if(r.src==='mined'){mined++;if(!r.last)unplayed++;}if(r.last==='ok')solved++;else if(r.last==='miss')revenge++;}return{mined,solved,revenge,unplayed};}
 let bankQ=[];
 function shuffle(a){for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];}return a;}
-function refillBank(){bankQ=shuffle(BANK.filter(p=>!Mine.seen.has(p.f)));if(!bankQ.length){Mine.seen.clear();bankQ=shuffle(BANK.slice());}}
+function refillBank(){
+  const done=p=>{const r=Coll.get(p.f);return r&&r.last==='ok';};
+  bankQ=shuffle(BANK.filter(p=>!Mine.seen.has(p.f)&&!done(p)));
+  if(!bankQ.length)bankQ=shuffle(BANK.filter(p=>!Mine.seen.has(p.f)));
+  if(!bankQ.length){Mine.seen.clear();bankQ=shuffle(BANK.slice());}
+}
+function pickLevel(arr,level){return arr.find(p=>p.l===level)||arr[0];}
 function takePuzzle(level){
-  const pick=arr=>{let i=arr.findIndex(p=>p.l===level&&!Mine.seen.has(p.f));if(i<0)i=arr.findIndex(p=>!Mine.seen.has(p.f));return i;};
-  let i=pick(Mine.fresh);
-  if(i>=0){const p=Mine.fresh.splice(i,1)[0];Mine.seen.add(p.f);throttle();return p;}
+  const avail=r=>!Mine.seen.has(r.f);
+  const use=(p,kind)=>{Mine.seen.add(p.f);throttle();return{pz:p,kind};};
+  const all=[...Coll.values()];
+  // revenge: puzzles you got wrong last time come back now and then
+  if(G.n>2&&Math.random()<0.25){const rv=all.filter(r=>avail(r)&&r.last==='miss');if(rv.length)return use(pickLevel(shuffle(rv),level),'revenge');}
+  // your own mined puzzles you haven't played yet, newest first
+  const un=all.filter(r=>avail(r)&&r.src==='mined'&&!r.last).sort((a,b)=>b.at-a.at);
+  if(un.length)return use(pickLevel(un,level),'mined');
   if(!bankQ.length)refillBank();
-  i=pick(bankQ);if(i<0){refillBank();i=0;}
-  const p=bankQ.splice(i,1)[0];Mine.seen.add(p.f);return p;
+  let i=bankQ.findIndex(p=>p.l===level&&avail(p));if(i<0)i=bankQ.findIndex(avail);if(i<0){refillBank();i=0;}
+  return use(bankQ.splice(i,1)[0],'bank');
 }
 function startMining(){
   const n=Math.max(1,Math.min(4,(navigator.hardwareConcurrency||2)-1));
@@ -525,12 +554,12 @@ onmessage=e=>{const d=e.data;if(d.cmd==='init'){miner=new Miner(d.depth);running
 }
 function onWorker(i,d){
   if(d.type==='puzzle'){
-    if(!Mine.seen.has(d.pz.f)&&!Mine.fresh.some(p=>p.f===d.pz.f)){d.pz.fresh=true;Mine.fresh.push(d.pz);Mine.session++;Mine.total++;store.set('mined',Mine.total);}
+    if(!Coll.has(d.pz.f)&&!BANK.some(p=>p.f===d.pz.f)){const r=Object.assign(clean(d.pz),{src:'mined',at:d.pz.at||Date.now()});Coll.set(r.f,r);DB.put(r);Mine.session++;}
     throttle();
   }else Mine.stats[i]=d;
 }
 function throttle(){
-  const want=!document.hidden&&Mine.fresh.length<40;
+  const want=!document.hidden&&collStats().unplayed<60;
   if(want===!Mine.paused)return;
   Mine.paused=!want;Mine.workers.forEach(w=>w.postMessage({cmd:want?'resume':'pause'}));
 }
@@ -544,13 +573,15 @@ function hud(){
   const led=$('#led');
   if(Mine.error||!Mine.workers.length){led.className='led off';$('#hud').innerHTML=`<span class="k">status </span> <span class="v">workers unavailable here — playing from the ${BANK.length}-puzzle bank</span>`;return;}
   led.className='led'+(Mine.paused?' off':'');
-  const npsTxt=Mine.paused?'idle (queue full)':(Mine.nps/1e6).toFixed(2)+'M nodes/s';
+  const cs=collStats();
+  const npsTxt=Mine.paused?(document.hidden?'paused (tab hidden)':'idle (60 unplayed in stock)'):(Mine.nps/1e6).toFixed(2)+'M nodes/s';
   $('#hud').innerHTML=
 `<span class="k">workers </span> <span class="v">${Mine.workers.length} × αβ search, depth 4 + quiescence</span>
 <span class="k">speed   </span> <span class="a">${npsTxt}</span>
 <span class="k">searched</span> <span class="v">${fmt(nodes)} nodes · ${fmt(scanned)} positions</span>
-<span class="k">mined   </span> <span class="a">${Mine.session} fresh</span> <span class="v">this visit · ${fmt(Mine.total)} all-time on this device</span>
-<span class="k">queue   </span> <span class="v">${Mine.fresh.length} fresh ⚡ + ${BANK.length} in bank</span>`;
+<span class="k">mined   </span> <span class="a">${Mine.session} this visit</span> <span class="v">· ${fmt(cs.mined)} saved on this device</span>
+<span class="k">library </span> <span class="v">${cs.unplayed} unplayed ⚡ · ${fmt(cs.solved)} solved · </span><span class="a">${cs.revenge} to revenge ↺</span>
+<span class="k">bank    </span> <span class="v">${BANK.length} build-time puzzles${DB.db?'':' · storage unavailable, nothing is kept'}</span>`;
   Mine.stats.forEach((s,i)=>{const el=$('#cb'+i);if(el)el.style.width=Mine.paused?'0%':Math.min(100,30+((s.ply||0)/80)*70)+'%';});
 }
 
@@ -567,6 +598,7 @@ function start(mode){
   show('game');nextPuzzle();
   if(G.running){G.lastTick=performance.now();requestAnimationFrame(tick);}
 }
+function ago(t){const s=Math.max(1,Math.round((Date.now()-t)/1000));return s<60?s+'s ago':s<3600?Math.round(s/60)+'m ago':s<86400?Math.round(s/3600)+'h ago':Math.round(s/86400)+'d ago';}
 function fmtClock(ms){ms=Math.max(0,ms);const s=ms/1000;if(s<10)return s.toFixed(1);const m=Math.floor(s/60),r=Math.floor(s%60);return m+':'+String(r).padStart(2,'0');}
 function tick(now){
   if(!G.running)return;
@@ -580,12 +612,13 @@ function flash(kind){const f=$('#flash');f.className='';void f.offsetWidth;f.cla
 
 function nextPuzzle(){
   const n=G.n++,level=G.mode==='zen'?(1+Math.floor(Math.random()*3)):(n<5?1:n<13?2:3);
-  const pz=takePuzzle(level);
+  const{pz,kind}=takePuzzle(level);G.kind=kind;
   G.pz=pz;G.P=new Pos(pz.f);G.flip=G.P.side===8;G.sel=null;G.last=null;G.arrow=null;G.lock=false;G.tries=0;G.legalMoves=G.P.legal();G.pStart=performance.now();
   const white=G.P.side===0;
   $('#tomove').textContent=(white?'White':'Black')+' to move';$('#chip').className='chip '+(white?'w':'b');
   const b=$('#badge');
-  if(pz.fresh){const ago=Math.max(1,Math.round((Date.now()-pz.at)/1000));b.className='badge fresh';b.textContent=`⚡ mined ${ago<60?ago+'s':Math.round(ago/60)+'m'} ago`;}
+  if(kind==='mined'){b.className='badge fresh';b.textContent='⚡ mined '+ago(pz.at);}
+  else if(kind==='revenge'){const r=Coll.get(pz.f);b.className='badge rev';b.textContent=`↺ revenge · missed ${r.missed}×`;}
   else{b.className='badge';b.textContent='bank #'+(BANK.indexOf(pz)+1);}
   $('#feedback').innerHTML=G.mode==='zen'?`<span class="meta">Level ${'●'.repeat(pz.l)}${'○'.repeat(3-pz.l)} · one move wins. Find it.</span>`:'';
   $('#b-next').hidden=true;if(G.mode==='zen')$('#b-reveal').hidden=false;
@@ -596,15 +629,63 @@ function draw(){
   if(G.sel!=null)targets=new Set(G.legalMoves.filter(m=>FROM(m)===G.sel).map(TO));
   renderBoard($('#board'),G.P,{flip:G.flip,sel:G.sel,targets,last:G.last,arrow:G.arrow,arrowColor:G.arrowColor,coords:true});
 }
-function onSquare(sq){
-  if(G.lock)return;
-  const P=G.P,p=P.b[sq];
-  if(G.sel!=null){
-    const c=G.legalMoves.filter(m=>FROM(m)===G.sel&&TO(m)===sq);
-    if(c.length){if(c.length>1)return askPromo(c);return tryMove(c[0]);}
-  }
-  G.sel=(p&&(p&8)===P.side&&G.sel!==sq)?sq:null;draw();
+/* input: tap-tap or drag-and-drop, both always work */
+let drag=null;
+function squareAt(x,y){
+  const r=$('#board').getBoundingClientRect();
+  if(x<r.left||y<r.top||x>=r.right||y>=r.bottom)return -1;
+  let vf=Math.floor((x-r.left)/r.width*8),vr=Math.floor((y-r.top)/r.height*8);
+  if(G.flip){vf=7-vf;vr=7-vr;}
+  return vr*16+vf;
 }
+function playTo(from,to){
+  const c=G.legalMoves.filter(m=>FROM(m)===from&&TO(m)===to);
+  if(!c.length)return false;
+  if(c.length>1)askPromo(c);else tryMove(c[0]);
+  return true;
+}
+function onDown(e){
+  if(G.lock||!$('#promo').hidden)return;
+  const sq=squareAt(e.clientX,e.clientY);if(sq<0)return;
+  e.preventDefault();
+  const P=G.P,p=P.b[sq];
+  if(G.sel!=null&&G.sel!==sq&&playTo(G.sel,sq))return;   // tap-tap move
+  if(p&&(p&8)===P.side){
+    const wasSel=G.sel===sq;G.sel=sq;draw();
+    drag={from:sq,wasSel,x:e.clientX,y:e.clientY,moved:false,ghost:null,hover:-1,id:e.pointerId};
+    try{$('#board').setPointerCapture(e.pointerId);}catch(_){}
+  }else{G.sel=null;draw();}
+}
+function onMove(e){
+  if(!drag||e.pointerId!==drag.id)return;
+  if(!drag.moved){
+    if(Math.hypot(e.clientX-drag.x,e.clientY-drag.y)<6)return;
+    drag.moved=true;
+    const p=G.P.b[drag.from],size=$('#board').getBoundingClientRect().width/8;
+    const g=document.createElement('span');g.className='pc ghost '+((p&8)?'b':'w');g.textContent=glyph(p);g.style.fontSize=(size*.84)+'px';
+    document.body.appendChild(g);drag.ghost=g;
+    const src=$(`#board .sq[data-sq="${drag.from}"] .pc`);if(src)src.style.opacity='.25';
+  }
+  drag.ghost.style.left=e.clientX+'px';drag.ghost.style.top=e.clientY+'px';
+  const sq=squareAt(e.clientX,e.clientY);
+  if(sq!==drag.hover){
+    const old=$(`#board .sq[data-sq="${drag.hover}"]`);if(old)old.classList.remove('hover');
+    const nw=$(`#board .sq[data-sq="${sq}"]`);if(nw&&sq!==drag.from)nw.classList.add('hover');
+    drag.hover=sq;
+  }
+}
+function onUp(e){
+  if(!drag||e.pointerId!==drag.id)return;
+  const d=drag;drag=null;
+  if(d.ghost)d.ghost.remove();
+  if(G.lock){draw();return;}
+  if(d.moved){
+    const to=squareAt(e.clientX,e.clientY);
+    if(to>=0&&to!==d.from&&playTo(d.from,to))return;
+    draw();                                   // dropped off-target: piece snaps back, stays selected
+  }else if(d.wasSel){G.sel=null;draw();}      // tapped the selected piece again: deselect
+}
+function onCancel(){if(!drag)return;if(drag.ghost)drag.ghost.remove();drag=null;draw();}
 function askPromo(cands){
   const el=$('#promo'),side=G.P.side;el.hidden=false;
   el.innerHTML=[5,2,4,3].map(t=>`<button data-t="${t}"><span class="pc ${side?'b':'w'}" style="font-size:44px">${glyph(t)}</span></button>`).join('');
@@ -617,7 +698,7 @@ function tryMove(m){
 }
 function solved(m,dt){
   const san=G.P.san(m);
-  G.results.push({pz:G.pz,ok:true,dt,san});G.score++;G.streak++;G.best=Math.max(G.best,G.streak);
+  G.results.push({pz:G.pz,ok:true,dt,san});record(G.pz,G.tries===0);G.score++;G.streak++;G.best=Math.max(G.best,G.streak);
   $('#score').textContent=G.score;$('#streak').textContent=G.streak;
   G.P.make(m);G.last=[FROM(m),TO(m)];G.arrow=null;G.lock=true;flash('good');
   const info=G.pz.k?G.pz.t:`${G.pz.t} · wins ${(G.pz.s/100).toFixed(1)}`;
@@ -635,7 +716,7 @@ function missed(m,dt){
     draw();return;
   }
   G.misses++;G.streak=0;$('#streak').textContent=0;
-  G.results.push({pz:G.pz,ok:false,dt,san:bestSan,yours});
+  G.results.push({pz:G.pz,ok:false,dt,san:bestSan,yours});record(G.pz,false);
   G.time-=G.M.pen;floatTxt('−'+G.M.pen/1000+'s',false);
   G.arrow=[FROM(best),TO(best)];G.arrowColor='rgba(43,212,125,.9)';G.lock=true;
   $('#feedback').innerHTML=`<span class="san no">✗ ${yours}</span> &nbsp;<span class="meta">it was</span> <span class="san ok">${bestSan}</span> <span class="meta">· ${G.pz.t}</span>`;
@@ -654,7 +735,7 @@ function playLine(rest,firstSan){
 function reveal(){
   if(G.lock)return;
   const best=G.P.parse(G.pz.m),san=G.P.san(best);
-  G.results.push({pz:G.pz,ok:false,dt:performance.now()-G.pStart,san});
+  G.results.push({pz:G.pz,ok:false,dt:performance.now()-G.pStart,san});record(G.pz,false);
   G.arrow=[FROM(best),TO(best)];G.lock=true;G.streak=0;$('#streak').textContent=0;
   $('#feedback').innerHTML=`<span class="meta">Answer:</span> <span class="san ok">${san}</span> <span class="meta">· ${G.pz.t}</span>`;
   $('#b-reveal').hidden=true;$('#b-next').hidden=false;draw();
@@ -681,13 +762,16 @@ function endRun(){
 
 /* ---------- wiring ---------- */
 document.querySelectorAll('.mode').forEach(b=>b.addEventListener('click',()=>start(b.dataset.mode)));
-$('#board').addEventListener('pointerdown',e=>{const s=e.target.closest('.sq');if(s){e.preventDefault();onSquare(+s.dataset.sq);}});
+const bdEl=$('#board');
+bdEl.addEventListener('pointerdown',onDown);bdEl.addEventListener('pointermove',onMove);
+bdEl.addEventListener('pointerup',onUp);bdEl.addEventListener('pointercancel',onCancel);
 $('#b-next').onclick=()=>nextPuzzle();
 $('#b-reveal').onclick=reveal;
 $('#b-quit').onclick=()=>{if(G.mode==='zen'||!G.running){G.running=false;if(G.results.length)endRun();else{show('home');}}else{G.time=0;}};
 $('#b-again').onclick=()=>start(G.mode);
 $('#b-menu').onclick=()=>show('home');
-refreshPB();refillBank();startMining();hud();setInterval(hud,1000);
+refreshPB();hud();
+(async()=>{await DB.open();for(const r of await DB.all())Coll.set(r.f,r);refillBank();startMining();hud();setInterval(hud,1000);})();
 </script>
 </body>
 </html>
